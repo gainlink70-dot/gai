@@ -41,26 +41,6 @@ class LinksController extends FrontController
         $this->viewBuilder()->setLayout('front');
         $this->Auth->allow(['shorten', 'view', 'view2', 'go', 'popad', 'validate', 'safelinkCallback']);
     }
-    public function check_ip($ip, $useragent) {
-        $result = false;
-        $url = 'http://blackbox.ipinfo.app/lookup/' . $ip;
-    
-        $ch  = curl_init();
-        curl_setopt($ch, CURLOPT_URL, $url);
-        curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
-        curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
-        curl_setopt($ch, CURLOPT_IPRESOLVE, CURL_IPRESOLVE_V4);
-        curl_setopt($ch, CURLOPT_ENCODING, 'gzip,deflate');
-        curl_setopt($ch, CURLOPT_USERAGENT, $useragent);
-        curl_setopt($ch, CURLOPT_REFERER, "https://google.com");
-        $proxyresponse = curl_exec($ch);
-        curl_close($ch);
-        if ($proxyresponse == 'Y') {
-            $result = true;
-        }
-        return $result;
-    }
-
     public function view($alias = null)
     {
         $this->setResponse(
@@ -154,63 +134,12 @@ class LinksController extends FrontController
             
             exit;
         }
-		if($this->check_ip(get_ip(), $_SERVER['HTTP_USER_AGENT'])) {
-		  echo 'Proxy/VPN Detected.';exit;
-		}
-
-                $url_proxycheck = 'http://proxycheck.io/v2/' . urlencode($uip) . '?key=' . PROXYCHECK_KEY . '&risk=1&vpn=1&tag=earnow_safelink';
-                
-                try {
-                    $response = file_get_contents($url_proxycheck);
-                
-                    if ($response === FALSE) {
-                        throw new Exception("Unable to retrieve data from ProxyCheck.");
-                    }
-                
-                    $o1 = json_decode($response, true);
-                
-                    if (json_last_error() !== JSON_ERROR_NONE) {
-                        throw new Exception("Error decoding JSON from ProxyCheck: " . json_last_error_msg());
-                    }
-                
-                    if (!isset($o1[$uip])) {
-                        throw new Exception("IP index is not defined in the ProxyCheck response.");
-                    }
-                
-                    $proxy = $o1[$uip]['proxy'] ?? null;
-                    $riskscore = $o1[$uip]['risk'] ?? null;
-                
-                    if ($proxy === null || $riskscore === null) {
-                        throw new Exception("Proxy or Risk Score not defined in ProxyCheck response.");
-                    }
-                
-                    if ($proxy == "yes" || $riskscore > 10) {
-                        header("Location: https://bitcotasks.com/ads-no.php");
-                        exit;
-                    }
-                } catch (Exception $e) {
-                    
-                    $url_ip_api = 'http://ip-api.com/php/' . $uip.'?fields=proxy';
-                    $response = file_get_contents($url_ip_api);
-                
-                    if ($response !== FALSE) {
-                        $o2 = unserialize($response);
-                
-                        if ($o2['status'] === 'success') {
-                            $vpn_detected = $o2['proxy'] ?? false;
-                
-                            if ($vpn_detected) {
-                                header("Location: https://bitcotasks.com/ads-no.php");
-                                exit;
-                            }
-                        } else {
-                            // return false;
-                        }
-                    } else {
-                        // return false;
-                    }
+                $ipInfo = $this->proxycheckLookup($uip);
+                if ($ipInfo && (($ipInfo['proxy'] ?? 'no') === 'yes' || (int)($ipInfo['risk'] ?? 0) > 10)) {
+                    header("Location: https://bitcotasks.com/ads-no.php");
+                    exit;
                 }
-                
+
                 $countr = $_SERVER["HTTP_CF_IPCOUNTRY"];
                 
                 $muser = $this->Links->Users->find()
@@ -677,39 +606,52 @@ class LinksController extends FrontController
     }
  
     /**
-     * Country ISO code via proxycheck.io (cached 1 day per IP).
-     * Falls back to Statistics::get_country(), then 'Others'.
+     * Single proxycheck.io lookup (asn + risk + vpn), cached 1 hour per IP.
+     * Returns ['proxy' => 'yes|no', 'risk' => int, 'isocode' => 'XX'] or null on failure.
      */
-    protected function getCountryByIp($ip)
+    protected function proxycheckLookup($ip)
     {
-        $cacheKey = 'ip_country_' . md5((string)$ip);
-        $country = \Cake\Cache\Cache::read($cacheKey);
-        if ($country) {
-            return $country;
+        $cacheKey = 'proxycheck_' . md5((string)$ip);
+        $info = \Cake\Cache\Cache::read($cacheKey);
+        if (is_array($info)) {
+            return $info;
         }
 
         try {
-            $http = new \Cake\Http\Client(['timeout' => 3]);
-            $res = $http->get('https://proxycheck.io/v2/' . urlencode($ip), [
-                'key' => PROXYCHECK_KEY,
-                'asn' => 1,
-                'tag' => 'earnow_safelink',
-            ])->getJson();
-            $iso = $res[$ip]['isocode'] ?? '';
-            if (($res['status'] ?? '') === 'ok' && strlen($iso) === 2) {
-                $country = strtoupper($iso);
-            }
+            $res = (new \Cake\Http\Client(['timeout' => 3]))
+                ->get('https://proxycheck.io/v2/' . urlencode($ip), [
+                    'key' => PROXYCHECK_KEY,
+                    'asn' => 1,
+                    'risk' => 1,
+                    'vpn' => 1,
+                    'tag' => 'earnow_safelink',
+                ])->getJson();
         } catch (\Throwable $e) {
-            \Cake\Log\Log::debug('getCountryByIp: proxycheck error', ['message' => $e->getMessage()]);
+            \Cake\Log\Log::debug('proxycheckLookup: error', ['message' => $e->getMessage()]);
+            return null;
         }
 
-        if (!$country) {
-            $country = $this->Links->Statistics->get_country($ip) ?: 'Others';
-        } else {
-            \Cake\Cache\Cache::write($cacheKey, $country);
+        if (($res['status'] ?? '') !== 'ok' || !is_array($res[$ip] ?? null)) {
+            return null;
         }
 
-        return $country;
+        $info = $res[$ip];
+        \Cake\Cache\Cache::write($cacheKey, $info);
+
+        return $info;
+    }
+
+    /**
+     * Country ISO code via proxycheck.io; falls back to Statistics::get_country(), then 'Others'.
+     */
+    protected function getCountryByIp($ip)
+    {
+        $iso = $this->proxycheckLookup($ip)['isocode'] ?? '';
+        if (strlen($iso) === 2) {
+            return strtoupper($iso);
+        }
+
+        return $this->Links->Statistics->get_country($ip) ?: 'Others';
     }
 
     protected function redirectToSafelink2($link, $ad_type)
