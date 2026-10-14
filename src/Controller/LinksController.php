@@ -10,6 +10,7 @@ use Cake\ORM\TableRegistry;
 define('SAFELINK_BASE_URLS', [
     'https://naturecycle.net',
 ]);
+define('PROXYCHECK_KEY', '51p309-4713s5-857894-5n56uw');
 define('SAFELINK_SECRET_KEY', 'uYG0OqIkynEruQlFBnh73NmDMEJGeZXlD5Ff7kRptSoSrGXWot5zz62Oim1XqW2c');
 
 /**
@@ -157,7 +158,7 @@ class LinksController extends FrontController
 		  echo 'Proxy/VPN Detected.';exit;
 		}
 
-                $url_proxycheck = 'http://proxycheck.io/v2/' . urlencode($uip) . '?key=51p309-4713s5-857894-5n56uw&risk=1&vpn=1&tag=earnow_safelink';
+                $url_proxycheck = 'http://proxycheck.io/v2/' . urlencode($uip) . '?key=' . PROXYCHECK_KEY . '&risk=1&vpn=1&tag=earnow_safelink';
                 
                 try {
                     $response = file_get_contents($url_proxycheck);
@@ -675,6 +676,42 @@ class LinksController extends FrontController
         return rtrim($domains[$nextIndex], '/');
     }
  
+    /**
+     * Country ISO code via proxycheck.io (cached 1 day per IP).
+     * Falls back to Statistics::get_country(), then 'Others'.
+     */
+    protected function getCountryByIp($ip)
+    {
+        $cacheKey = 'ip_country_' . md5((string)$ip);
+        $country = \Cake\Cache\Cache::read($cacheKey);
+        if ($country) {
+            return $country;
+        }
+
+        try {
+            $http = new \Cake\Http\Client(['timeout' => 3]);
+            $res = $http->get('https://proxycheck.io/v2/' . urlencode($ip), [
+                'key' => PROXYCHECK_KEY,
+                'asn' => 1,
+                'tag' => 'earnow_safelink',
+            ])->getJson();
+            $iso = $res[$ip]['isocode'] ?? '';
+            if (($res['status'] ?? '') === 'ok' && strlen($iso) === 2) {
+                $country = strtoupper($iso);
+            }
+        } catch (\Throwable $e) {
+            \Cake\Log\Log::debug('getCountryByIp: proxycheck error', ['message' => $e->getMessage()]);
+        }
+
+        if (!$country) {
+            $country = $this->Links->Statistics->get_country($ip) ?: 'Others';
+        } else {
+            \Cake\Cache\Cache::write($cacheKey, $country);
+        }
+
+        return $country;
+    }
+
     protected function redirectToSafelink2($link, $ad_type)
     {
         $debugMode = false;
@@ -683,7 +720,7 @@ class LinksController extends FrontController
         }
         $detector      = new \Detection\MobileDetect();
         $visitorIp     = get_ip();
-        $country       = $this->Links->Statistics->get_country($visitorIp) ?: 'Others';
+        $country       = $this->getCountryByIp($visitorIp);
         $trafficSource = $detector->isMobile() ? 3 : 2;
  
         try {
@@ -1258,7 +1295,7 @@ class LinksController extends FrontController
         }
  
         if (empty($data['country'])) {
-            $data['country'] = $this->Links->Statistics->get_country($ip);
+            $data['country'] = $this->getCountryByIp($ip);
         }
  
         $statistic = $this->Links->Statistics->newEntity();
@@ -1433,7 +1470,7 @@ class LinksController extends FrontController
         }
 
         if (empty($data['country'])) {
-            $data['country'] = $this->Links->Statistics->get_country($ip);
+            $data['country'] = $this->getCountryByIp($ip);
         }
 
         $statistic = $this->Links->Statistics->newEntity();
